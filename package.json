@@ -1,0 +1,51 @@
+{
+  "name": "pi-mcp-adapter",
+  "version": "1.1.0",
+  "description": "MCP (Model Context Protocol) adapter extension for Pi coding agent",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nico Bailon",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicobailon/pi-mcp-adapter"
+  },
+  "keywords": [
+    "pi",
+    "mcp",
+    "model-context-protocol",
+    "ai",
+    "coding-agent",
+    "extension",
+    "claude",
+    "llm"
+  ],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": [
+    "index.ts",
+    "types.ts",
+    "config.ts",
+    "server-manager.ts",
+    "tool-registrar.ts",
+    "resource-tools.ts",
+    "lifecycle.ts",
+    "oauth-handler.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "ARCHITECTURE.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "@sinclair/typebox": "^0.32.0"
+  },
+  "peerDependencies": {
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "zod": "^3.25.0"
+  }
+}
