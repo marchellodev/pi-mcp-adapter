@@ -6,7 +6,7 @@ import https from "node:https";
 import os from "node:os";
 import { execSync } from "node:child_process";
 
-const REPO_URL = "https://raw.githubusercontent.com/nicobailon/pi-mcp-adapter/master";
+const REPO_URL = "https://raw.githubusercontent.com/nicobailon/pi-mcp-adapter/main";
 const EXT_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-mcp-adapter");
 const SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
 const EXT_PATH = "~/.pi/agent/extensions/pi-mcp-adapter/index.ts";
