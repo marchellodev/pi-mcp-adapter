@@ -15,11 +15,10 @@ But there's an active ecosystem of well-maintained MCP servers for databases, br
 ## Install
 
 ```bash
-cd ~/.pi/agent/extensions
-npm install pi-mcp-adapter
+npx pi-mcp-adapter
 ```
 
-Restart Pi.
+This downloads the extension to `~/.pi/agent/extensions/pi-mcp-adapter/`, installs dependencies, and configures Pi to load it. Restart Pi after installation.
 
 ## Quick Start
 
