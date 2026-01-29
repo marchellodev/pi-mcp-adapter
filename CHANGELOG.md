@@ -7,7 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-01-29
+
 ### Added
+- **Unified pi tool search** - `mcp({ search: "..." })` now searches both MCP tools and Pi tools (from installed extensions)
+- Pi tools appear first in results with `[pi tool]` prefix
+- Details object includes `server: "pi"` for pi tools
 - Banner image for README
 
 ## [1.5.1] - 2026-01-26

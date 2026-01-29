@@ -111,7 +111,7 @@ Supported: `cursor`, `claude-code`, `claude-desktop`, `vscode`, `windsurf`, `cod
 | Call | `mcp({ tool: "...", args: '{"key": "value"}' })` |
 | Status | `mcp({ })` or `mcp({ server: "name" })` |
 
-Search includes parameter schemas by default. Space-separated words are OR'd.
+Search includes both MCP tools and Pi tools (from extensions). Pi tools appear first with `[pi tool]` prefix. Space-separated words are OR'd.
 
 ## Commands
 

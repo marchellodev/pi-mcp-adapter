@@ -1,5 +1,5 @@
 // index.ts - Full extension entry point with commands
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { loadMcpConfig } from "./config.js";
 import { formatToolName, type McpConfig, type McpContent } from "./types.js";
@@ -48,6 +48,9 @@ async function parallelLimit<T, R>(
 export default function mcpAdapter(pi: ExtensionAPI) {
   let state: McpExtensionState | null = null;
   let initPromise: Promise<McpExtensionState> | null = null;
+  
+  // Capture pi tool accessor (closure) for unified search
+  const getPiTools = (): ToolInfo[] => pi.getAllTools();
   
   pi.registerFlag("mcp-config", {
     description: "Path to MCP config file",
@@ -173,7 +176,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
 Usage:
   mcp({ })                              → Show server status
   mcp({ server: "name" })               → List tools from server
-  mcp({ search: "query" })              → Search for tools (includes schemas, space-separated words OR'd)
+  mcp({ search: "query" })              → Search for tools (MCP + pi, space-separated words OR'd)
   mcp({ describe: "tool_name" })        → Show tool details and parameters
   mcp({ tool: "name", args: '{"key": "value"}' })    → Call a tool (args is JSON string)
 
@@ -248,7 +251,7 @@ Mode: tool (call) > describe > search > server (list) > nothing (status)`,
         return executeDescribe(state, params.describe);
       }
       if (params.search) {
-        return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas);
+        return executeSearch(state, params.search, params.regex, params.server, params.includeSchemas, getPiTools);
       }
       if (params.server) {
         return executeList(state, params.server);
@@ -425,7 +428,8 @@ function executeSearch(
   query: string,
   regex?: boolean,
   server?: string,
-  includeSchemas?: boolean
+  includeSchemas?: boolean,
+  getPiTools?: () => ToolInfo[]
 ) {
   // Default to including schemas
   const showSchemas = includeSchemas !== false;
@@ -455,6 +459,24 @@ function executeSearch(
     };
   }
   
+  // Search pi tools (unless server filter is specified)
+  const piMatches: Array<{ name: string; description: string }> = [];
+  if (!server && getPiTools) {
+    const piTools = getPiTools();
+    for (const tool of piTools) {
+      // Skip the mcp tool itself to avoid confusion
+      if (tool.name === "mcp") continue;
+      
+      if (pattern.test(tool.name) || pattern.test(tool.description ?? "")) {
+        piMatches.push({
+          name: tool.name,
+          description: tool.description ?? "",
+        });
+      }
+    }
+  }
+  
+  // Search MCP tools (existing logic)
   for (const [serverName, metadata] of state.toolMetadata.entries()) {
     if (server && serverName !== server) continue;
     for (const tool of metadata) {
@@ -467,7 +489,10 @@ function executeSearch(
     }
   }
   
-  if (matches.length === 0) {
+  // Combine counts
+  const totalCount = piMatches.length + matches.length;
+  
+  if (totalCount === 0) {
     const msg = server
       ? `No tools matching "${query}" in "${server}"`
       : `No tools matching "${query}"`;
@@ -477,8 +502,27 @@ function executeSearch(
     };
   }
   
-  let text = `Found ${matches.length} tool${matches.length === 1 ? "" : "s"} matching "${query}":\n\n`;
+  let text = `Found ${totalCount} tool${totalCount === 1 ? "" : "s"} matching "${query}":\n\n`;
   
+  // Pi tools first (with [pi tool] prefix)
+  for (const match of piMatches) {
+    if (showSchemas) {
+      // Full format (consistent with MCP tools)
+      text += `[pi tool] ${match.name}\n`;
+      text += `  ${match.description || "(no description)"}\n`;
+      text += `  No parameters (call directly).\n`;
+      text += "\n";
+    } else {
+      // Compact format
+      text += `[pi tool] ${match.name}`;
+      if (match.description) {
+        text += ` - ${truncateAtWord(match.description, 50)}`;
+      }
+      text += "\n";
+    }
+  }
+  
+  // MCP tools (existing format, no prefix change for backwards compat)
   for (const match of matches) {
     if (showSchemas) {
       // Full format with schema
@@ -502,7 +546,15 @@ function executeSearch(
   
   return {
     content: [{ type: "text" as const, text: text.trim() }],
-    details: { mode: "search", matches: matches.map(m => ({ server: m.server, tool: m.tool.name })), count: matches.length, query },
+    details: {
+      mode: "search",
+      matches: [
+        ...piMatches.map(m => ({ server: "pi", tool: m.name })),
+        ...matches.map(m => ({ server: m.server, tool: m.tool.name })),
+      ],
+      count: totalCount,
+      query,
+    },
   };
 }
 
