@@ -70,6 +70,8 @@ export interface ServerEntry {
   idleTimeout?: number; // minutes, overrides global setting
   // Resource handling
   exposeResources?: boolean;
+  // Direct tool registration
+  directTools?: boolean | string[];
   // Debug
   debug?: boolean;  // Show server stderr (default: false)
 }
@@ -78,6 +80,7 @@ export interface ServerEntry {
 export interface McpSettings {
   toolPrefix?: "server" | "none" | "short";
   idleTimeout?: number; // minutes, default 10, 0 to disable
+  directTools?: boolean;
 }
 
 // Root config
@@ -96,6 +99,32 @@ export interface ToolMetadata {
   description: string;
   resourceUri?: string;   // For resource tools: the URI to read
   inputSchema?: unknown;  // JSON Schema for parameters (stored for describe/errors)
+}
+
+export interface DirectToolSpec {
+  serverName: string;
+  originalName: string;
+  prefixedName: string;
+  description: string;
+  inputSchema?: unknown;
+  resourceUri?: string;
+}
+
+export interface ServerProvenance {
+  path: string;
+  kind: "user" | "project" | "import";
+  importKind?: string;
+}
+
+export interface McpPanelCallbacks {
+  reconnect: (serverName: string) => Promise<boolean>;
+  getConnectionStatus: (serverName: string) => "connected" | "idle" | "failed" | "needs-auth";
+  refreshCacheAfterReconnect: (serverName: string) => import("./metadata-cache.js").ServerCacheEntry | null;
+}
+
+export interface McpPanelResult {
+  changes: Map<string, true | string[] | false>;
+  cancelled: boolean;
 }
 
 /**

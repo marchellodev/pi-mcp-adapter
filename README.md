@@ -89,6 +89,7 @@ Two calls instead of 26 tools cluttering the context.
 | `lifecycle` | `"lazy"` (default), `"eager"`, or `"keep-alive"` |
 | `idleTimeout` | Minutes before idle disconnect (overrides global) |
 | `exposeResources` | Expose MCP resources as tools (default: true) |
+| `directTools` | `true`, `string[]`, or `false` — register tools individually instead of through proxy |
 | `debug` | Show server stderr (default: false) |
 
 ### Lifecycle Modes
@@ -113,8 +114,67 @@ Two calls instead of 26 tools cluttering the context.
 |---------|-------------|
 | `toolPrefix` | `"server"` (default), `"short"` (strips `-mcp` suffix), or `"none"` |
 | `idleTimeout` | Global idle timeout in minutes (default: 10, 0 to disable) |
+| `directTools` | Global default for all servers (default: false). Per-server overrides this. |
 
 Per-server `idleTimeout` overrides the global setting.
+
+### Direct Tools
+
+By default, all MCP tools are accessed through the single `mcp` proxy tool. This keeps context small but means the LLM has to discover tools via search. If you want specific tools to show up directly in the agent's tool list — alongside `read`, `bash`, `edit`, etc. — add `directTools` to your config.
+
+Per-server:
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@latest"],
+      "directTools": true
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "directTools": ["search_repositories", "get_file_contents"]
+    },
+    "huge-server": {
+      "command": "npx",
+      "args": ["-y", "mega-mcp@latest"]
+    }
+  }
+}
+```
+
+| Value | Behavior |
+|-------|----------|
+| `true` | Register all tools from this server as individual Pi tools |
+| `["tool_a", "tool_b"]` | Register only these tools (use original MCP names) |
+| Omitted or `false` | Proxy only (default) |
+
+To set a global default for all servers:
+
+```json
+{
+  "settings": {
+    "directTools": true
+  },
+  "mcpServers": {
+    "huge-server": {
+      "directTools": false
+    }
+  }
+}
+```
+
+Per-server `directTools` overrides the global setting. The example above registers direct tools for every server except `huge-server`.
+
+Each direct tool costs ~150-300 tokens in the system prompt (name + description + schema). Good for targeted sets of 5-20 tools. For servers with 75+ tools, stick with the proxy or pick specific tools with a `string[]`.
+
+Direct tools register from the metadata cache (`~/.pi/agent/mcp-cache.json`), so no server connections are needed at startup. On the first session after adding `directTools` to a new server, the cache won't exist yet — tools fall back to proxy-only and the cache populates in the background. Restart Pi and they'll be available. To force it: `/mcp reconnect <server>` then restart.
+
+**Interactive configuration:** Run `/mcp` to open an interactive panel showing all servers with connection status, tools, and direct/proxy toggles. You can reconnect servers, initiate OAuth, and toggle tools between direct and proxy — all from one overlay. Changes are written to your config file; restart Pi to apply.
+
+**Subagent integration:** If you use the subagent extension, agents can request direct MCP tools in their frontmatter with `mcp:server-name` syntax. See the subagent README for details.
 
 ### Import Existing Configs
 
@@ -152,7 +212,7 @@ Tool names are fuzzy-matched on hyphens and underscores — `context7_resolve_li
 
 | Command | What it does |
 |---------|--------------|
-| `/mcp` | Server status |
+| `/mcp` | Interactive panel (server status, tool toggles, reconnect) |
 | `/mcp tools` | List all tools |
 | `/mcp reconnect` | Reconnect all servers |
 | `/mcp reconnect <server>` | Connect or reconnect a single server |
@@ -169,6 +229,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full picture. Short version:
 - npx-based servers resolve to direct binary paths, skipping the ~143 MB npm parent process
 - MCP server validates arguments, not the adapter
 - Keep-alive servers get health checks and auto-reconnect
+- Specific tools can be promoted from the proxy to first-class Pi tools via `directTools` config, so the LLM sees them directly instead of having to search
 
 ## Limitations
 

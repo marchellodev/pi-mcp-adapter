@@ -1,6 +1,6 @@
 {
   "name": "pi-mcp-adapter",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "MCP (Model Context Protocol) adapter extension for Pi coding agent",
   "type": "module",
   "license": "MIT",
@@ -40,6 +40,7 @@
     "metadata-cache.ts",
     "npx-resolver.ts",
     "oauth-handler.ts",
+    "mcp-panel.ts",
     "README.md",
     "CHANGELOG.md",
     "ARCHITECTURE.md",

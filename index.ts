@@ -2,17 +2,19 @@
 import type { ExtensionAPI, ExtensionContext, ToolInfo } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
-import { loadMcpConfig } from "./config.js";
-import { formatToolName, getServerPrefix, type McpConfig, type McpContent, type ToolMetadata, type McpTool, type McpResource, type ServerEntry } from "./types.js";
+import { loadMcpConfig, getServerProvenance, writeDirectToolsConfig } from "./config.js";
+import { formatToolName, getServerPrefix, type McpConfig, type McpContent, type ToolMetadata, type McpTool, type McpResource, type ServerEntry, type DirectToolSpec, type McpPanelCallbacks, type McpPanelResult } from "./types.js";
 import { McpServerManager } from "./server-manager.js";
 import { McpLifecycleManager } from "./lifecycle.js";
 import { transformMcpContent } from "./tool-registrar.js";
 import { resourceNameToToolName } from "./resource-tools.js";
+import { getStoredTokens } from "./oauth-handler.js";
 import {
   computeServerHash,
   getMetadataCachePath,
   isServerCacheValid,
   loadMetadataCache,
+  type MetadataCache,
   reconstructToolMetadata,
   saveMetadataCache,
   serializeResources,
@@ -66,10 +68,284 @@ async function parallelLimit<T, R>(
   return results;
 }
 
+const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
+
+function getConfigPathFromArgv(): string | undefined {
+  const idx = process.argv.indexOf("--mcp-config");
+  if (idx >= 0 && idx + 1 < process.argv.length) {
+    return process.argv[idx + 1];
+  }
+  return undefined;
+}
+
+function resolveDirectTools(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  prefix: "server" | "none" | "short",
+  envOverride?: string[],
+): DirectToolSpec[] {
+  const specs: DirectToolSpec[] = [];
+  if (!cache) return specs;
+
+  const seenNames = new Set<string>();
+
+  const envServers = new Set<string>();
+  const envTools = new Map<string, Set<string>>();
+  if (envOverride) {
+    for (let item of envOverride) {
+      item = item.replace(/\/+$/, "");
+      if (item.includes("/")) {
+        const [server, tool] = item.split("/", 2);
+        if (server && tool) {
+          if (!envTools.has(server)) envTools.set(server, new Set());
+          envTools.get(server)!.add(tool);
+        } else if (server) {
+          envServers.add(server);
+        }
+      } else if (item) {
+        envServers.add(item);
+      }
+    }
+  }
+
+  const globalDirect = config.settings?.directTools;
+
+  for (const [serverName, definition] of Object.entries(config.mcpServers)) {
+    const serverCache = cache.servers[serverName];
+    if (!serverCache || !isServerCacheValid(serverCache, definition)) continue;
+
+    let toolFilter: true | string[] | false = false;
+
+    if (envOverride) {
+      if (envServers.has(serverName)) {
+        toolFilter = true;
+      } else if (envTools.has(serverName)) {
+        toolFilter = [...envTools.get(serverName)!];
+      }
+    } else {
+      if (definition.directTools !== undefined) {
+        toolFilter = definition.directTools;
+      } else if (globalDirect) {
+        toolFilter = globalDirect;
+      }
+    }
+
+    if (!toolFilter) continue;
+
+    for (const tool of serverCache.tools ?? []) {
+      if (toolFilter !== true && !toolFilter.includes(tool.name)) continue;
+      const prefixedName = formatToolName(tool.name, serverName, prefix);
+      if (BUILTIN_NAMES.has(prefixedName)) {
+        console.warn(`MCP: skipping direct tool "${prefixedName}" (collides with builtin)`);
+        continue;
+      }
+      if (seenNames.has(prefixedName)) {
+        console.warn(`MCP: skipping duplicate direct tool "${prefixedName}" from "${serverName}"`);
+        continue;
+      }
+      seenNames.add(prefixedName);
+      specs.push({
+        serverName,
+        originalName: tool.name,
+        prefixedName,
+        description: tool.description ?? "",
+        inputSchema: tool.inputSchema,
+      });
+    }
+
+    if (definition.exposeResources !== false) {
+      for (const resource of serverCache.resources ?? []) {
+        const baseName = `get_${resourceNameToToolName(resource.name)}`;
+        if (toolFilter !== true && !toolFilter.includes(baseName)) continue;
+        const prefixedName = formatToolName(baseName, serverName, prefix);
+        if (BUILTIN_NAMES.has(prefixedName)) {
+          console.warn(`MCP: skipping direct resource tool "${prefixedName}" (collides with builtin)`);
+          continue;
+        }
+        if (seenNames.has(prefixedName)) {
+          console.warn(`MCP: skipping duplicate direct resource tool "${prefixedName}" from "${serverName}"`);
+          continue;
+        }
+        seenNames.add(prefixedName);
+        specs.push({
+          serverName,
+          originalName: baseName,
+          prefixedName,
+          description: resource.description ?? `Read resource: ${resource.uri}`,
+          resourceUri: resource.uri,
+        });
+      }
+    }
+  }
+
+  return specs;
+}
+
+function buildProxyDescription(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  directSpecs: DirectToolSpec[],
+): string {
+  let desc = `MCP gateway - connect to MCP servers and call their tools.\n`;
+
+  const directByServer = new Map<string, number>();
+  for (const spec of directSpecs) {
+    directByServer.set(spec.serverName, (directByServer.get(spec.serverName) ?? 0) + 1);
+  }
+  if (directByServer.size > 0) {
+    const parts = [...directByServer.entries()].map(
+      ([server, count]) => `${server} (${count})`,
+    );
+    desc += `\nDirect tools available (call as normal tools): ${parts.join(", ")}\n`;
+  }
+
+  const serverSummaries: string[] = [];
+  for (const serverName of Object.keys(config.mcpServers)) {
+    const entry = cache?.servers?.[serverName];
+    const definition = config.mcpServers[serverName];
+    const toolCount = entry?.tools?.length ?? 0;
+    const resourceCount = definition?.exposeResources !== false ? (entry?.resources?.length ?? 0) : 0;
+    const totalItems = toolCount + resourceCount;
+    if (totalItems === 0) continue;
+    const directCount = directByServer.get(serverName) ?? 0;
+    const proxyCount = totalItems - directCount;
+    if (proxyCount > 0) {
+      serverSummaries.push(`${serverName} (${proxyCount} tools)`);
+    }
+  }
+
+  if (serverSummaries.length > 0) {
+    desc += `\nServers: ${serverSummaries.join(", ")}\n`;
+  }
+
+  desc += `\nUsage:\n`;
+  desc += `  mcp({ })                              → Show server status\n`;
+  desc += `  mcp({ server: "name" })               → List tools from server\n`;
+  desc += `  mcp({ search: "query" })              → Search for tools (MCP + pi, space-separated words OR'd)\n`;
+  desc += `  mcp({ describe: "tool_name" })        → Show tool details and parameters\n`;
+  desc += `  mcp({ connect: "server-name" })       → Connect to a server and refresh metadata\n`;
+  desc += `  mcp({ tool: "name", args: '{"key": "value"}' })    → Call a tool (args is JSON string)\n`;
+  desc += `\nMode: tool (call) > connect > describe > search > server (list) > nothing (status)`;
+
+  return desc;
+}
+
 export default function mcpAdapter(pi: ExtensionAPI) {
   let state: McpExtensionState | null = null;
   let initPromise: Promise<McpExtensionState> | null = null;
-  
+
+  const earlyConfigPath = getConfigPathFromArgv();
+  const earlyConfig = loadMcpConfig(earlyConfigPath);
+  const earlyCache = loadMetadataCache();
+  const prefix = earlyConfig.settings?.toolPrefix ?? "server";
+
+  const envRaw = process.env.MCP_DIRECT_TOOLS;
+  const directSpecs = envRaw === "__none__"
+    ? []
+    : resolveDirectTools(
+        earlyConfig,
+        earlyCache,
+        prefix,
+        envRaw?.split(",").map(s => s.trim()).filter(Boolean),
+      );
+
+  for (const spec of directSpecs) {
+    pi.registerTool({
+      name: spec.prefixedName,
+      label: `MCP: ${spec.originalName}`,
+      description: spec.description || "(no description)",
+      parameters: Type.Unsafe<Record<string, unknown>>(spec.inputSchema || { type: "object", properties: {} }),
+      async execute(_toolCallId, params) {
+        if (!state && initPromise) {
+          try { state = await initPromise; } catch {
+            return {
+              content: [{ type: "text" as const, text: "MCP initialization failed" }],
+              details: { error: "init_failed" },
+            };
+          }
+        }
+        if (!state) {
+          return {
+            content: [{ type: "text" as const, text: "MCP not initialized" }],
+            details: { error: "not_initialized" },
+          };
+        }
+
+        const s = state;
+        const connected = await lazyConnect(s, spec.serverName);
+        if (!connected) {
+          const failedAgo = getFailureAgeSeconds(s, spec.serverName);
+          return {
+            content: [{ type: "text" as const, text: `MCP server "${spec.serverName}" not available${failedAgo !== null ? ` (failed ${failedAgo}s ago)` : ""}` }],
+            details: { error: "server_unavailable", server: spec.serverName },
+          };
+        }
+
+        const connection = s.manager.getConnection(spec.serverName);
+        if (!connection || connection.status !== "connected") {
+          return {
+            content: [{ type: "text" as const, text: `MCP server "${spec.serverName}" not connected` }],
+            details: { error: "not_connected", server: spec.serverName },
+          };
+        }
+
+        try {
+          s.manager.touch(spec.serverName);
+          s.manager.incrementInFlight(spec.serverName);
+
+          if (spec.resourceUri) {
+            const result = await connection.client.readResource({ uri: spec.resourceUri });
+            const content = (result.contents ?? []).map(c => ({
+              type: "text" as const,
+              text: "text" in c ? c.text : ("blob" in c ? `[Binary data: ${(c as { mimeType?: string }).mimeType ?? "unknown"}]` : JSON.stringify(c)),
+            }));
+            return {
+              content: content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }],
+              details: { server: spec.serverName, resourceUri: spec.resourceUri },
+            };
+          }
+
+          const result = await connection.client.callTool({
+            name: spec.originalName,
+            arguments: params ?? {},
+          });
+
+          const mcpContent = (result.content ?? []) as McpContent[];
+          const content = transformMcpContent(mcpContent);
+
+          if (result.isError) {
+            let errorText = content.filter(c => c.type === "text").map(c => (c as { text: string }).text).join("\n") || "Tool execution failed";
+            if (spec.inputSchema) {
+              errorText += `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}`;
+            }
+            return {
+              content: [{ type: "text" as const, text: `Error: ${errorText}` }],
+              details: { error: "tool_error", server: spec.serverName },
+            };
+          }
+
+          return {
+            content: content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }],
+            details: { server: spec.serverName, tool: spec.originalName },
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          let errorText = `Failed to call tool: ${message}`;
+          if (spec.inputSchema) {
+            errorText += `\n\nExpected parameters:\n${formatSchema(spec.inputSchema)}`;
+          }
+          return {
+            content: [{ type: "text" as const, text: errorText }],
+            details: { error: "call_failed", server: spec.serverName },
+          };
+        } finally {
+          s.manager.decrementInFlight(spec.serverName);
+          s.manager.touch(spec.serverName);
+        }
+      },
+    });
+  }
+
   // Capture pi tool accessor (closure) for unified search
   const getPiTools = (): ToolInfo[] => pi.getAllTools();
   
@@ -140,7 +416,11 @@ export default function mcpAdapter(pi: ExtensionAPI) {
         case "status":
         case "":
         default:
-          await showStatus(state, ctx);
+          if (ctx.hasUI) {
+            await openMcpPanel(state, pi, ctx, earlyConfigPath);
+          } else {
+            await showStatus(state, ctx);
+          }
           break;
       }
     },
@@ -178,17 +458,7 @@ export default function mcpAdapter(pi: ExtensionAPI) {
   pi.registerTool({
     name: "mcp",
     label: "MCP",
-    description: `MCP gateway - connect to MCP servers and call their tools.
-
-Usage:
-  mcp({ })                              → Show server status
-  mcp({ server: "name" })               → List tools from server
-  mcp({ search: "query" })              → Search for tools (MCP + pi, space-separated words OR'd)
-  mcp({ describe: "tool_name" })        → Show tool details and parameters
-  mcp({ connect: "server-name" })       → Connect to a server and refresh metadata
-  mcp({ tool: "name", args: '{"key": "value"}' })    → Call a tool (args is JSON string)
-
-Mode: tool (call) > connect > describe > search > server (list) > nothing (status)`,
+    description: buildProxyDescription(earlyConfig, earlyCache, directSpecs),
     parameters: Type.Object({
       // Call mode
       tool: Type.Optional(Type.String({ description: "Tool name to call (e.g., 'xcodebuild_list_sims')" })),
@@ -988,6 +1258,45 @@ async function initializeMcp(
     ctx.ui.notify(msg, "info");
   }
 
+  const envDirect = process.env.MCP_DIRECT_TOOLS;
+  if (envDirect !== "__none__") {
+    const missingCacheServers: string[] = [];
+    const currentCache = loadMetadataCache();
+    for (const [name, definition] of serverEntries) {
+      const hasDirect = definition.directTools !== undefined
+        ? !!definition.directTools
+        : !!config.settings?.directTools;
+      if (!hasDirect) continue;
+      const entry = currentCache?.servers?.[name];
+      if (!entry || !isServerCacheValid(entry, definition)) {
+        missingCacheServers.push(name);
+      }
+    }
+
+    if (missingCacheServers.length > 0) {
+      const bootstrapResults = await parallelLimit(
+        missingCacheServers.filter(name => !results.some(r => r.name === name && r.connection)),
+        10,
+        async (name) => {
+          const definition = config.mcpServers[name];
+          try {
+            const connection = await manager.connect(name, definition);
+            const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix);
+            toolMetadata.set(name, metadata);
+            updateMetadataCache(state, name);
+            return { name, ok: true };
+          } catch {
+            return { name, ok: false };
+          }
+        },
+      );
+      const bootstrapped = bootstrapResults.filter(r => r.ok).map(r => r.name);
+      if (bootstrapped.length > 0 && ctx.hasUI) {
+        ctx.ui.notify(`MCP: direct tools for ${bootstrapped.join(", ")} will be available after restart`, "info");
+      }
+    }
+  }
+
   lifecycle.setReconnectCallback((serverName) => {
     updateServerMetadata(state, serverName);
     updateMetadataCache(state, serverName);
@@ -1328,6 +1637,55 @@ async function authenticateServer(
     `4. Run /mcp reconnect to connect with the token`,
     "info"
   );
+}
+
+async function openMcpPanel(
+  state: McpExtensionState,
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  configOverridePath?: string,
+): Promise<void> {
+  const config = state.config;
+  const cache = loadMetadataCache();
+  const provenanceMap = getServerProvenance(pi.getFlag("mcp-config") as string | undefined ?? configOverridePath);
+
+  const callbacks: McpPanelCallbacks = {
+    reconnect: async (serverName: string) => {
+      return lazyConnect(state, serverName);
+    },
+    getConnectionStatus: (serverName: string) => {
+      const definition = config.mcpServers[serverName];
+      if (definition?.auth === "oauth" && getStoredTokens(serverName) === undefined) {
+        return "needs-auth";
+      }
+      const connection = state.manager.getConnection(serverName);
+      if (connection?.status === "connected") return "connected";
+      if (getFailureAgeSeconds(state, serverName) !== null) return "failed";
+      return "idle";
+    },
+    refreshCacheAfterReconnect: (serverName: string) => {
+      const freshCache = loadMetadataCache();
+      return freshCache?.servers?.[serverName] ?? null;
+    },
+  };
+
+  const { createMcpPanel } = await import("./mcp-panel.js");
+
+  return new Promise<void>((resolve) => {
+    ctx.ui.custom(
+      (tui, _theme, _keybindings, done) => {
+        return createMcpPanel(config, cache, provenanceMap, callbacks, tui, (result: McpPanelResult) => {
+          if (!result.cancelled && result.changes.size > 0) {
+            writeDirectToolsConfig(result.changes, provenanceMap, config);
+            ctx.ui.notify("Direct tools updated. Restart pi to apply.", "info");
+          }
+          done();
+          resolve();
+        });
+      },
+      { overlay: true, overlayOptions: { anchor: "center", width: 82 } },
+    );
+  });
 }
 
 /**
